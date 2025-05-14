@@ -1,47 +1,59 @@
-# client_yolo.py
-from ultralytics import YOLO
-import cv2
 import flwr as fl
-import numpy as np
-import base64
-import io
+import os
+import cv2
+from ultralytics import YOLO
 
 class YOLOClient(fl.client.NumPyClient):
-    def __init__(self, model_path, video_path):
-        self.model = YOLO(model_path)
+    def __init__(self, video_path, model_path, output_folder):
         self.video_path = video_path
+        self.model_path = model_path
+        self.output_folder = output_folder
+        self.input_folder = "frames"
+
+        os.makedirs(self.input_folder, exist_ok=True)
+        os.makedirs(self.output_folder, exist_ok=True)
 
     def get_parameters(self, config):
         return []
 
     def set_parameters(self, parameters):
-        pass  # Not used for inference
+        pass
 
     def fit(self, parameters, config):
-        # Perform inference
-        cap = cv2.VideoCapture(self.video_path)
-        frame_count = 0
-        detections = []
+        # Step 1: Extract frames
+        self.extract_frames(self.video_path, self.input_folder)
 
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret or frame_count > 5:  # Just process 5 frames
-                break
-            results = self.model(frame)
-            det_frame = results[0].plot()
+        # Step 2: Run YOLO detection
+        model = YOLO(self.model_path)
 
-            # Encode frame to base64
-            _, buffer = cv2.imencode('.jpg', det_frame)
-            b64 = base64.b64encode(buffer).decode("utf-8")
-            detections.append(b64)
+        for img in os.listdir(self.input_folder):
+            frame_path = os.path.join(self.input_folder, img)
+            result = model(frame_path)
+            result[0].save(filename=os.path.join(self.output_folder, img))
 
-            frame_count += 1
-
-        cap.release()
-        return [], len(detections), {"detections": detections}
+        return [], len(os.listdir(self.output_folder)), {}
 
     def evaluate(self, parameters, config):
         return 0.0, 0, {}
 
+    def extract_frames(self, video_path, output_folder, fps_interval=1):
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        interval = int(fps * fps_interval)
+        count, saved = 0, 0
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if count % interval == 0:
+                frame_filename = f"{output_folder}/frame_{saved:04d}.jpg"
+                cv2.imwrite(frame_filename, frame)
+                saved += 1
+            count += 1
+        cap.release()
+
 def main():
-    fl.client.start_numpy_client(server_address="localhost:8080", client=YOLOClient("my_model.pt", "video.mp4"))
+    client = YOLOClient("static/uploads/video.mp4", "my_model.pt", "static/output")
+    fl.client.start_numpy_client(server_address="localhost:8080", client=client)
+
