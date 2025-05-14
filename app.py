@@ -1,7 +1,6 @@
 from flask import Flask, request, render_template, redirect, url_for
 import os
 import threading
-import flwr as fl
 import subprocess
 import base64
 
@@ -19,29 +18,27 @@ detection_results = []
 @app.route("/", methods=["GET", "POST"])
 def index():
     global detection_results
-
-    if request.method == "POST":
-        if "video" not in request.files:
-            return redirect(request.url)
-        file = request.files["video"]
-        if file.filename == "":
-            return redirect(request.url)
-        if file:
-            filepath = os.path.join(app.config["UPLOAD_FOLDER"], "video.mp4")
-            file.save(filepath)
-            return redirect(url_for("detect"))
-
     return render_template("index.html", detections=detection_results)
+
+@app.route("/start-training", methods=["POST"])
+def start_training():
+    # Get parameters from form
+    rounds = request.form.get("rounds")
+    clients = request.form.get("clients")
+    dataset = request.form.get("dataset")
+    data_distribution = request.form.get("data_distribution")
+
+    print(f"[INFO] Starting training: Rounds={rounds}, Clients={clients}, Dataset={dataset}, Dist={data_distribution}")
+
+    # You can pass these parameters to your training script via environment variables or CLI args
+    threading.Thread(target=lambda: subprocess.run(["python", "server_yolo.py"])).start()
+    threading.Thread(target=lambda: subprocess.run(["python", "client_yolo.py"])).start()
+
+    return "Training started! You can check back later for results.", 200
 
 @app.route("/detect")
 def detect():
     global detection_results
-
-    threading.Thread(target=lambda: subprocess.run(["python", "server_yolo.py"])).start()
-    threading.Thread(target=lambda: subprocess.run(["python", "client_yolo.py"])).start()
-
-    import time
-    time.sleep(10)
 
     detection_results.clear()
     for filename in os.listdir(OUTPUT_FOLDER):
@@ -51,6 +48,10 @@ def detect():
                 detection_results.append(b64)
 
     return redirect(url_for("index"))
+
+@app.route("/result")
+def result_page():
+    return "Result page coming soon."  # or render_template("result.html")
 
 if __name__ == "__main__":
     app.run(debug=True)
