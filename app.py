@@ -22,7 +22,9 @@ def index():
 
 @app.route("/start-training", methods=["POST"])
 def start_training():
-    # Get parameters from form
+    import threading, subprocess, time
+
+    # Optional: retrieve form params (if needed)
     rounds = request.form.get("rounds")
     clients = request.form.get("clients")
     dataset = request.form.get("dataset")
@@ -30,16 +32,15 @@ def start_training():
 
     print(f"[INFO] Starting training: Rounds={rounds}, Clients={clients}, Dataset={dataset}, Dist={data_distribution}")
 
-    # You can pass these parameters to your training script via environment variables or CLI args
+    # Start detection threads
     threading.Thread(target=lambda: subprocess.run(["python", "server_yolo.py"])).start()
     threading.Thread(target=lambda: subprocess.run(["python", "client_yolo.py"])).start()
 
-    return "Training started! You can check back later for results.", 200
+    # Wait for detection to complete
+    time.sleep(10)
 
-@app.route("/detect")
-def detect():
+    # Reload results to show on index.html
     global detection_results
-
     detection_results.clear()
     for filename in os.listdir(OUTPUT_FOLDER):
         if filename.endswith(".jpg"):
@@ -48,10 +49,6 @@ def detect():
                 detection_results.append(b64)
 
     return redirect(url_for("index"))
-
-@app.route("/result")
-def result_page():
-    return "Result page coming soon."  # or render_template("result.html")
 
 if __name__ == "__main__":
     app.run(debug=True)

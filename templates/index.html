@@ -1,43 +1,30 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Federated Learning Parameters</title>
-    <style>
-        .result-button {
-            display: block;
-            width: 200px;
-            margin: 50px auto; /* 상하 여백 50px, 좌우 자동으로 중앙 정렬 */
-            padding: 10px 0;
-            background-color: #4CAF50; /* 진한 녹색 */
-            color: white; /* 텍스트 색상 흰색 */
-            border: none;
-            border-radius: 5px; /* 모서리 둥글게 */
-            cursor: pointer;
-            font-size: 16px; /* 글자 크기 */
-            transition: background-color 0.3s; /* 배경색 변경시 트랜지션 */
-        }
-        
-        .result-button:hover {
-            background-color: #45a049; /* 호버시 색상 변경 */
-        }
-    </style>
+    <meta charset="UTF-8">
+    <title>Train Detection via Federated Learning</title>
 </head>
 <body>
-    <h1>Enter Federated Learning Parameters</h1>
-    <form action="/start-training" method="post" target="_blank">
-        <input type="text" name="rounds" placeholder="Rounds(int)">
-        <input type="text" name="clients" placeholder="Clients(int)">
-        <input type="text" name="dataset" placeholder="Dataset(cifar/mnist)">
-        <input type="text" name="data_distribution" placeholder="1:IID / 0:Non-IID">
-        <input type="submit" value="Start Training">
+    <h1>Train Detection Dashboard</h1>
+
+    <!-- Upload Form -->
+    <form method="POST" enctype="multipart/form-data">
+        <p>Select a video file to upload:</p>
+        <input type="file" name="video" accept="video/*" required>
+        <input type="submit" value="Upload and Start Detection">
     </form>
 
-    <button class="result-button" onclick="goToResultPage()">Go to Result Page</button>
-    <script>
-        function goToResultPage() {
-            // Flask 등의 서버 사이드 라우팅을 사용하는 경우 적절한 URL 경로로 변경
-            window.location.href = '/result'; 
-        }
-    </script>
+    <hr>
+
+    <!-- Detection Results -->
+    <h2>Detection Results:</h2>
+    {% if detections %}
+        {% for image in detections %}
+            <img src="data:image/jpeg;base64,{{ image }}" width="640" style="margin-bottom: 20px;">
+        {% endfor %}
+    {% else %}
+        <p>No detection results yet. Upload a video and start detection above.</p>
+    {% endif %}
 </body>
 </html>
+
