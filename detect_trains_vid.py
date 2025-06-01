@@ -85,7 +85,7 @@ os.makedirs(output_folder, exist_ok=True)
 extract_frames(video_path, input_folder)
 
 # Step 2: Load YOLOv8 model
-model = YOLO("my_model.pt")  # Replace with custom model if trained
+model = YOLO("yolov8n.pt")  # Replace with custom model if trained
 
 # Step 3: Run inference on each frame
 for img in os.listdir(input_folder):

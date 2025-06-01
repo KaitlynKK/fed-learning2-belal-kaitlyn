@@ -4,14 +4,13 @@ from ultralytics import YOLO
 import flwr as fl
 
 class YOLOClient(fl.client.NumPyClient):
-    def __init__(self, video_path, model_path, output_folder):
-        self.video_path = video_path
+    def __init__(self, video_paths, model_path, output_root):
+        self.video_paths = video_paths
         self.model_path = model_path
-        self.output_folder = output_folder
-        self.input_folder = "frames"
-
-        os.makedirs(self.input_folder, exist_ok=True)
-        os.makedirs(self.output_folder, exist_ok=True)
+        self.output_root = output_root
+        self.input_root = "frames"
+        os.makedirs(self.input_root, exist_ok=True)
+        os.makedirs(self.output_root, exist_ok=True)
 
     def get_parameters(self, config):
         return []
@@ -21,75 +20,67 @@ class YOLOClient(fl.client.NumPyClient):
 
     def fit(self, parameters, config):
         print("[CLIENT] FIT STARTED")
-        print(f"[CLIENT] Video path: {self.video_path}")
-        print(f"[CLIENT] Model path: {self.model_path}")
-        print(f"[CLIENT] Output path: {self.output_folder}")
-
-        self.extract_frames(self.video_path, self.input_folder)
-        frames = os.listdir(self.input_folder)
-        print(f"[CLIENT] Frames extracted: {frames}")
-
-        if len(frames) == 0:
-            print("[CLIENT] ❌ No frames extracted. Exiting early.")
-            return [], 0, {}
-
         model = YOLO(self.model_path)
-        print("[CLIENT] YOLO model loaded.")
 
-        result_count = 0
-        for img in frames:
-            frame_path = os.path.join(self.input_folder, img)
-            print(f"[CLIENT] Running detection on: {frame_path}")
-            result = model(frame_path)
-            if result and result[0]:
-                save_path = os.path.join(self.output_folder, img)
-                result[0].save(filename=save_path)
-                print(f"[CLIENT] Saved: {save_path}")
-                result_count += 1
-            else:
-                print(f"[CLIENT] No result for: {img}")
+        result_total = 0
 
-        print("[CLIENT] Detection complete.")
-        return [], result_count, {}
+        for i, video_path in enumerate(self.video_paths):
+            print(f"[CLIENT] Processing video: {video_path}")
+            input_folder = os.path.join(self.input_root, f"video_{i+1}")
+            output_folder = os.path.join(self.output_root, f"video_{i+1}")
+            os.makedirs(input_folder, exist_ok=True)
+            os.makedirs(output_folder, exist_ok=True)
+
+            self.extract_frames(video_path, input_folder)
+            frames = os.listdir(input_folder)
+            print(f"[CLIENT] Frames extracted: {frames}")
+
+            for img in frames:
+                frame_path = os.path.join(input_folder, img)
+                result = model(frame_path)
+                if result and result[0]:
+                    result[0].save(filename=os.path.join(output_folder, img))
+                    result_total += 1
+
+            print(f"[CLIENT] Finished video {i+1}, detections: {result_total}")
+
+        return [], result_total, {}
 
     def evaluate(self, parameters, config):
         return 0.0, 0, {}
 
     def extract_frames(self, video_path, output_folder, fps_interval=1):
-        print(f"[CLIENT] Reading from: {video_path}")
         cap = cv2.VideoCapture(video_path)
-
         if not cap.isOpened():
             print(f"[CLIENT] ❌ Cannot open video at: {video_path}")
             return
 
         fps = cap.get(cv2.CAP_PROP_FPS)
         interval = int(fps * fps_interval) if fps > 0 else 30
-        print(f"[CLIENT] FPS: {fps}, interval: {interval}")
-
         count, saved = 0, 0
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
             if count % interval == 0:
-                frame_filename = os.path.join(output_folder, f"frame_{saved:04d}.jpg")
-                cv2.imwrite(frame_filename, frame)
-                print(f"[CLIENT] Saved frame: {frame_filename}")
+                cv2.imwrite(os.path.join(output_folder, f"frame_{saved:04d}.jpg"), frame)
                 saved += 1
             count += 1
         cap.release()
-        print(f"[CLIENT] Total frames saved: {saved}")
 
 def main():
     print("[CLIENT] main() called.")
     client = YOLOClient(
-        "C:/fed-learning2-belal-kaitlyn/static/uploads/video.mp4",
-        "my_model.pt",
-        "static/output"
+        video_paths=[
+            "static/uploads/video1.mp4",
+            "static/uploads/video2.mp4"
+        ],
+        model_path="yolov8n.pt",
+        output_root="static/output"
     )
     fl.client.start_numpy_client(server_address="localhost:8080", client=client)
 
 if __name__ == "__main__":
     main()
+
 
