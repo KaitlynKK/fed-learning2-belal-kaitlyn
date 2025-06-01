@@ -20,14 +20,10 @@ class YOLOClient(fl.client.NumPyClient):
         pass
 
     def fit(self, parameters, config):
-        print("[CLIENT] 🚀 FIT STARTED")
-        print(f"[CLIENT] Video path: {self.video_path}")
-        print(f"[CLIENT] Model path: {self.model_path}")
-        print(f"[CLIENT] Output path: {self.output_folder}")
+        print("[CLIENT] 🚀 FIT STARTED (WOOSUNG STYLE)")
 
         self.extract_frames(self.video_path, self.input_folder)
         frames = os.listdir(self.input_folder)
-        print(f"[CLIENT] 📸 Frames extracted: {frames}")
 
         if len(frames) == 0:
             print("[CLIENT] ❌ No frames extracted. Exiting early.")
@@ -36,18 +32,36 @@ class YOLOClient(fl.client.NumPyClient):
         model = YOLO(self.model_path)
         print("[CLIENT] ✅ YOLO model loaded.")
 
+        CLASS_NAMES = [
+            'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat',
+            'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat',
+            'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'bunny', 'giraffe', 'backpack',
+            'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball',
+            'kite', 'baseball bat', 'baseball glove', 'skateboard', 'surfboard', 'tennis racket',
+            'bottle', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple',
+            'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair',
+            'couch', 'potted plant', 'bed', 'dining table', 'toilet', 'tv', 'laptop', 'mouse',
+            'remote', 'keyboard', 'cell phone', 'microwave', 'oven', 'toaster', 'sink', 'refrigerator',
+            'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
+        ]
+        train_class_id = CLASS_NAMES.index("train")
+
         result_count = 0
         for img in frames:
             frame_path = os.path.join(self.input_folder, img)
-            print(f"[CLIENT] 🔍 Running detection on: {frame_path}")
-            result = model(frame_path)
-            if result and result[0]:
+            results = model(frame_path)
+
+            if not results or not results[0]:
+                continue
+
+            classes = results[0].boxes.cls.tolist()
+            if train_class_id in map(int, classes):
                 save_path = os.path.join(self.output_folder, img)
-                result[0].save(filename=save_path)
-                print(f"[CLIENT] 💾 Saved: {save_path}")
+                results[0].save(filename=save_path)
+                print(f"[CLIENT] 🚂 Train detected — saved: {save_path}")
                 result_count += 1
             else:
-                print(f"[CLIENT] ⚠️ No result for: {img}")
+                print(f"[CLIENT] ❌ No train in: {img}")
 
         print(f"[CLIENT] ✅ Detection complete. {result_count} results saved.")
         return [], result_count, {}
