@@ -1,0 +1,4 @@
+names:
+- train
+train: frames/video_1
+val: frames/video_1
