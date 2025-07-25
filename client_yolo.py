@@ -105,7 +105,10 @@ class YOLOClient(fl.client.NumPyClient):
 
     def evaluate(self, parameters, config):
         print("[CLIENT] EVALUATE CALLED")
-        return 0.0, 0, {}
+        # Ensure this returns a non-zero value for num_examples
+        # A value of 1 is a placeholder to prevent ZeroDivisionError
+        # In a real scenario, this would be the actual number of evaluation examples
+        return 0.0, 1, {} 
 
 if __name__ == "__main__":
     client = YOLOClient()
