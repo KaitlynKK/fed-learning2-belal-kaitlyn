@@ -1,7 +1,7 @@
 task: detect
 mode: train
 model: model/my_model.pt
-data: C:\fed-learning2-belal-kaitlyn\output\client2\video_1\data.yaml
+data: C:\fed-learning2-belal-kaitlyn\output\client1\video_1\data.yaml
 epochs: 1
 time: null
 patience: 100
@@ -12,7 +12,7 @@ save_period: -1
 cache: false
 device: cpu
 workers: 8
-project: output/client2\video_1
+project: output/client1\video_1
 name: train_result
 exist_ok: true
 pretrained: true
@@ -102,4 +102,4 @@ auto_augment: randaugment
 erasing: 0.4
 cfg: null
 tracker: botsort.yaml
-save_dir: output\client2\video_1\train_result
+save_dir: output\client1\video_1\train_result
