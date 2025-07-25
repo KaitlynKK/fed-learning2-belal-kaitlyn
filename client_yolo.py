@@ -4,6 +4,7 @@ import argparse
 import yaml
 from ultralytics import YOLO
 import flwr as fl
+from pathlib import Path
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--video", required=True, help="Comma-separated list of video file paths")
@@ -30,52 +31,77 @@ class YOLOClient(fl.client.NumPyClient):
         print("[CLIENT] FIT STARTED")
         model = YOLO(self.model_path)
 
-        result_total = 0
-
         for i, video_path in enumerate(self.video_paths):
             print(f"[CLIENT] Processing video: {video_path}")
-            input_folder = os.path.join(self.input_root, f"video_{i+1}")
-            output_folder = os.path.join(self.output_root, f"video_{i+1}")
-            os.makedirs(input_folder, exist_ok=True)
+            video_name = f"video_{i+1}"
+            input_folder = os.path.join(self.input_root, video_name)
+            output_folder = os.path.join(self.output_root, video_name)
+
+            train_folder = os.path.join(input_folder, "train")
+            val_folder = os.path.join(input_folder, "val")
+            os.makedirs(train_folder, exist_ok=True)
+            os.makedirs(val_folder, exist_ok=True)
             os.makedirs(output_folder, exist_ok=True)
 
             # Extract frames from video
             cap = cv2.VideoCapture(video_path)
-            frame_count = 0
+            frames = []
             while True:
                 ret, frame = cap.read()
                 if not ret:
                     break
-                frame_path = os.path.join(input_folder, f"frame_{frame_count:04d}.jpg")
-                cv2.imwrite(frame_path, frame)
-                frame_count += 1
+                frames.append(frame)
             cap.release()
 
-            print(f"[CLIENT] Extracted {frame_count} frames from {video_path}")
+            print(f"[CLIENT] Extracted {len(frames)} frames from {video_path}")
+            if len(frames) == 0:
+                continue
 
-            # Generate temporary data.yaml file for YOLOv8 training
+            split_idx = int(0.8 * len(frames))
+            for idx, frame in enumerate(frames):
+                folder = train_folder if idx < split_idx else val_folder
+                frame_name = f"frame_{idx:04d}.jpg"
+                frame_path = os.path.join(folder, frame_name)
+                label_path = frame_path.replace(".jpg", ".txt")
+
+                cv2.imwrite(frame_path, frame)
+
+                # Generate dummy label if not present
+                if not os.path.exists(label_path):
+                    with open(label_path, "w") as f:
+                        f.write("0 0.5 0.5 0.3 0.3\n")
+
+            # Write data.yaml
             data_yaml_path = os.path.join(output_folder, "data.yaml")
             data_yaml = {
-                "train": input_folder.replace("\\", "/"),
-                "val": input_folder.replace("\\", "/"),
-                "names": ["train"]  # placeholder class name
+                "train": os.path.abspath(train_folder).replace("\\", "/"),
+                "val": os.path.abspath(val_folder).replace("\\", "/"),
+                "nc": 1,
+                "names": ["object"]
             }
             with open(data_yaml_path, "w") as f:
                 yaml.dump(data_yaml, f)
 
-            # Train YOLO
-            result = model.train(
-                data=data_yaml_path,
+            # Train YOLOv8
+            model.train(
+                data=os.path.abspath(data_yaml_path),
                 epochs=1,
                 imgsz=640,
                 project=output_folder,
                 name="train_result",
-                exist_ok=True
+                exist_ok=True,
+                plots=True,
+                save=True
             )
-            result_total += 1
+
+            # Optional cleanup: remove unwanted files
+            for f in ["results.csv", "args.yaml", "hyp.yaml"]:
+                fp = os.path.join(output_folder, "train_result", f)
+                if os.path.exists(fp):
+                    os.remove(fp)
 
         print("[CLIENT] Training complete")
-        return [], result_total, {}
+        return [], 1, {}
 
     def evaluate(self, parameters, config):
         print("[CLIENT] EVALUATE CALLED")
@@ -84,4 +110,5 @@ class YOLOClient(fl.client.NumPyClient):
 if __name__ == "__main__":
     client = YOLOClient()
     fl.client.start_numpy_client(server_address="localhost:8080", client=client)
+
 
