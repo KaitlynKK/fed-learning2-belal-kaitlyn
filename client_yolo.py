@@ -1,117 +1,127 @@
 import os
 import cv2
 import argparse
-import yaml
-from ultralytics import YOLO
-import flwr as fl
 from pathlib import Path
+from shutil import copy2
+import yaml
+import numpy as np
+import torch
+import flwr as fl
+from ultralytics import YOLO
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--video", required=True, help="Comma-separated list of video file paths")
-parser.add_argument("--model", default="model/my_model.pt", help="Path to YOLO model file")
-parser.add_argument("--output", default="output", help="Directory for output files")
-args = parser.parse_args()
+# -------- dataset prep from labeled_dir --------
+def prepare_from_labeled(labeled_dir: Path, train_folder: Path, val_folder: Path, split: float = 0.8):
+    img_dir = labeled_dir / "images"
+    lbl_dir = labeled_dir / "labels"
+    imgs = sorted([p for p in img_dir.glob("*.*") if p.suffix.lower() in {".jpg", ".jpeg", ".png"}])
+    if not imgs:
+        raise RuntimeError(f"No images found in {img_dir}. Expecting labeled dataset with images/ and labels/.")
 
+    split_idx = max(1, int(len(imgs) * split)) if len(imgs) > 1 else 1
+    sets = [("train", imgs[:split_idx]), ("val", imgs[split_idx:] or imgs[:1])]
+
+    for split_name, items in sets:
+        dest_root = train_folder if split_name == "train" else val_folder
+        (dest_root / "images").mkdir(parents=True, exist_ok=True)
+        (dest_root / "labels").mkdir(parents=True, exist_ok=True)
+        for img in items:
+            lbl = lbl_dir / (img.stem + ".txt")
+            copy2(img, dest_root / "images" / img.name)
+            if lbl.exists():
+                copy2(lbl, dest_root / "labels" / lbl.name)
+
+# -------- helpers to move weights between Flower <-> PyTorch --------
+def state_dict_to_ndarrays(sd):
+    # Stable order by iterating over items()
+    return [v.detach().cpu().numpy() for _, v in sd.items()]
+
+def ndarrays_to_state_dict_like(model, nds):
+    base_sd = model.model.state_dict()
+    if len(nds) != len(base_sd):
+        raise ValueError("Mismatched parameter count.")
+    new_sd = {}
+    for (k, v), arr in zip(base_sd.items(), nds):
+        t = torch.from_numpy(arr).to(v.device).to(v.dtype)
+        if t.shape != v.shape:
+            raise ValueError(f"Shape mismatch for {k}: got {t.shape}, expected {v.shape}")
+        new_sd[k] = t
+    return new_sd
+
+# ---------------- Flower client ----------------
 class YOLOClient(fl.client.NumPyClient):
-    def __init__(self):
-        self.video_paths = args.video.split(",")
-        self.model_path = args.model
-        self.output_root = args.output
-        self.input_root = "frames"
-        os.makedirs(self.input_root, exist_ok=True)
-        os.makedirs(self.output_root, exist_ok=True)
+    def __init__(self, args):
+        self.args = args
+        self.model = YOLO(args.model)  # MUST be same arch across all clients
+        self.labeled_dir = Path(args.labeled_dir)  # e.g., data/labelfront1
+        self.work_root = Path(args.work_root)      # e.g., output/client1
+        self.work_root.mkdir(parents=True, exist_ok=True)
 
     def get_parameters(self, config):
-        return []
+        return state_dict_to_ndarrays(self.model.model.state_dict())
 
     def set_parameters(self, parameters):
-        pass
+        new_sd = ndarrays_to_state_dict_like(self.model, parameters)
+        self.model.model.load_state_dict(new_sd, strict=True)
 
     def fit(self, parameters, config):
         print("[CLIENT] FIT STARTED")
-        model = YOLO(self.model_path)
+        if parameters:
+            self.set_parameters(parameters)
 
-        for i, video_path in enumerate(self.video_paths):
-            print(f"[CLIENT] Processing video: {video_path}")
-            video_name = f"video_{i+1}"
-            input_folder = os.path.join(self.input_root, video_name)
-            output_folder = os.path.join(self.output_root, video_name)
+        train_folder = self.work_root / "train"
+        val_folder = self.work_root / "val"
+        out_root = self.work_root / "runs"
+        for d in [train_folder, val_folder, out_root]:
+            d.mkdir(parents=True, exist_ok=True)
 
-            train_folder = os.path.join(input_folder, "train")
-            val_folder = os.path.join(input_folder, "val")
-            os.makedirs(train_folder, exist_ok=True)
-            os.makedirs(val_folder, exist_ok=True)
-            os.makedirs(output_folder, exist_ok=True)
+        # Build train/val from labeled dir
+        prepare_from_labeled(self.labeled_dir, train_folder, val_folder, split=self.args.split)
 
-            # Extract frames from video
-            cap = cv2.VideoCapture(video_path)
-            frames = []
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                frames.append(frame)
-            cap.release()
+        # Write data.yaml
+        data_yaml_path = out_root / "data.yaml"
+        data_yaml = {
+            "train": str(train_folder.resolve()).replace("\\", "/"),
+            "val": str(val_folder.resolve()).replace("\\", "/"),
+            "nc": self.args.nc,
+            "names": self.args.names.split(","),
+        }
+        with open(data_yaml_path, "w") as f:
+            yaml.dump(data_yaml, f)
 
-            print(f"[CLIENT] Extracted {len(frames)} frames from {video_path}")
-            if len(frames) == 0:
-                continue
+        # Train YOLO locally on this client's data
+        self.model.train(
+            data=str(data_yaml_path.resolve()),
+            epochs=self.args.epochs,
+            imgsz=self.args.imgsz,
+            project=str(out_root),
+            name="train_result",
+            exist_ok=True,
+            plots=True,
+            save=True,
+        )
 
-            split_idx = int(0.8 * len(frames))
-            for idx, frame in enumerate(frames):
-                folder = train_folder if idx < split_idx else val_folder
-                frame_name = f"frame_{idx:04d}.jpg"
-                frame_path = os.path.join(folder, frame_name)
-                label_path = frame_path.replace(".jpg", ".txt")
-
-                cv2.imwrite(frame_path, frame)
-
-                # Generate dummy label if not present
-                if not os.path.exists(label_path):
-                    with open(label_path, "w") as f:
-                        f.write("0 0.5 0.5 0.3 0.3\n")
-
-            # Write data.yaml
-            data_yaml_path = os.path.join(output_folder, "data.yaml")
-            data_yaml = {
-                "train": os.path.abspath(train_folder).replace("\\", "/"),
-                "val": os.path.abspath(val_folder).replace("\\", "/"),
-                "nc": 1,
-                "names": ["object"]
-            }
-            with open(data_yaml_path, "w") as f:
-                yaml.dump(data_yaml, f)
-
-            # Train YOLOv8
-            model.train(
-                data=os.path.abspath(data_yaml_path),
-                epochs=1,
-                imgsz=640,
-                project=output_folder,
-                name="train_result",
-                exist_ok=True,
-                plots=True,
-                save=True
-            )
-
-            # Optional cleanup: remove unwanted files
-            for f in ["results.csv", "args.yaml", "hyp.yaml"]:
-                fp = os.path.join(output_folder, "train_result", f)
-                if os.path.exists(fp):
-                    os.remove(fp)
-
-        print("[CLIENT] Training complete")
-        return [], 1, {}
+        # Return updated weights for aggregation
+        return self.get_parameters(config), 1, {}
 
     def evaluate(self, parameters, config):
-        print("[CLIENT] EVALUATE CALLED")
-        # Ensure this returns a non-zero value for num_examples
-        # A value of 1 is a placeholder to prevent ZeroDivisionError
-        # In a real scenario, this would be the actual number of evaluation examples
-        return 0.0, 1, {} 
+        # optional: implement a proper val here
+        if parameters:
+            self.set_parameters(parameters)
+        return 0.0, 1, {}
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--server", default="localhost:8080")
+    p.add_argument("--model", default="model/my_model.pt", help="Base YOLO checkpoint")
+    p.add_argument("--labeled_dir", required=True, help="Path to labeled dataset (images/ & labels/)")
+    p.add_argument("--work_root", required=True, help="Client working dir for outputs")
+    p.add_argument("--epochs", type=int, default=5)
+    p.add_argument("--imgsz", type=int, default=640)
+    p.add_argument("--split", type=float, default=0.8)
+    p.add_argument("--nc", type=int, default=1)
+    p.add_argument("--names", default="object")
+    return p.parse_args()
 
 if __name__ == "__main__":
-    client = YOLOClient()
-    fl.client.start_numpy_client(server_address="localhost:8080", client=client)
-
-
+    args = parse_args()
+    fl.client.start_numpy_client(server_address=args.server, client=YOLOClient(args))
