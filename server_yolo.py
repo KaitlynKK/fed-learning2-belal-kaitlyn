@@ -1,10 +1,10 @@
+import os
+import torch
 import flwr as fl
 from flwr.common import parameters_to_ndarrays
-import torch
 from ultralytics import YOLO
-import os
 
-# Custom strategy that stores the final global parameters after training
+# --- Strategy that remembers the last aggregated parameters ---
 class FedAvgWithSave(fl.server.strategy.FedAvg):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -12,43 +12,52 @@ class FedAvgWithSave(fl.server.strategy.FedAvg):
 
     def aggregate_fit(self, server_round, results, failures):
         aggregated, metrics = super().aggregate_fit(server_round, results, failures)
-        if aggregated:
+        if aggregated is not None:
             self.final_parameters = aggregated
         return aggregated, metrics
 
-# Initialize the strategy
-strategy = FedAvgWithSave(
-    min_fit_clients=4,
-    min_evaluate_clients=4,
-    min_available_clients=4,
-)
 
-# Start the federated learning server
-fl.server.start_server(
-    server_address="localhost:8080",
-    config=fl.server.ServerConfig(num_rounds=3),
-    strategy=strategy
-)
-
-# After training, save the final aggregated model if it exists
-if strategy.final_parameters:
+def save_final_model(params, base_ckpt="model/my_model.pt", out_path="static/output/final_model.pt"):
     print("[SERVER] ✅ Aggregation complete, saving model...")
 
-    # Load the base model used by clients
-    base_model = YOLO("model/my_model.pt")
+    base_model = YOLO(base_ckpt)
+    base_sd = base_model.model.state_dict()
 
-    # Convert FL parameters to a PyTorch-compatible format
-    ndarrays = parameters_to_ndarrays(strategy.final_parameters)
-    new_state_dict = {
-        k: torch.tensor(v)
-        for k, v in zip(base_model.model.state_dict().keys(), ndarrays)
-    }
+    ndarrays = parameters_to_ndarrays(params)
+    if len(ndarrays) != len(base_sd):
+        raise RuntimeError(
+            f"Mismatched param counts: agg={len(ndarrays)} vs model={len(base_sd)}. "
+            "Ensure client get_parameters() iterates state_dict in a stable order."
+        )
 
-    # Apply weights to base model and save
-    base_model.model.load_state_dict(new_state_dict, strict=False)
-    os.makedirs("static/output", exist_ok=True)
-    base_model.save("static/output/final_model.pt")
-    print("[SERVER] ✅ Final model saved to: static/output/final_model.pt")
-else:
-    print("[SERVER] ⚠️ No final parameters were found to save.")
+    new_sd = {}
+    for (k, v), arr in zip(base_sd.items(), ndarrays):
+        t = torch.from_numpy(arr).to(v.device).to(v.dtype)
+        if t.shape != v.shape:
+            raise RuntimeError(f"Shape mismatch for {k}: got {t.shape}, expected {v.shape}")
+        new_sd[k] = t
 
+    base_model.model.load_state_dict(new_sd, strict=True)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    base_model.save(out_path)
+    print(f"[SERVER] ✅ Final model saved to: {out_path}")
+
+
+if __name__ == "__main__":
+    strategy = FedAvgWithSave(
+        min_fit_clients=1,
+        min_evaluate_clients=1,
+        min_available_clients=1,
+    )
+
+    # 4 rounds = expect 4 sequential clients (one per round)
+    fl.server.start_server(
+        server_address="0.0.0.0:8080",
+        config=fl.server.ServerConfig(num_rounds=4),
+        strategy=strategy,
+    )
+
+    if strategy.final_parameters is not None:
+        save_final_model(strategy.final_parameters)
+    else:
+        print("[SERVER] ⚠️ No final parameters were found to save.")
