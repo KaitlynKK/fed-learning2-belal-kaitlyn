@@ -18,9 +18,9 @@ class FedAvgWithSave(fl.server.strategy.FedAvg):
 
 # Initialize the strategy
 strategy = FedAvgWithSave(
-    min_fit_clients=1,
-    min_evaluate_clients=1,
-    min_available_clients=1,
+    min_fit_clients=4,
+    min_evaluate_clients=4,
+    min_available_clients=4,
 )
 
 # Start the federated learning server
