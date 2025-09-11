@@ -16,7 +16,6 @@ class FedAvgWithSave(fl.server.strategy.FedAvg):
             self.final_parameters = aggregated
         return aggregated, metrics
 
-
 def save_final_model(params, base_ckpt="model/my_model.pt", out_path="static/output/final_model.pt"):
     print("[SERVER] ✅ Aggregation complete, saving model...")
 
@@ -42,7 +41,6 @@ def save_final_model(params, base_ckpt="model/my_model.pt", out_path="static/out
     base_model.save(out_path)
     print(f"[SERVER] ✅ Final model saved to: {out_path}")
 
-
 if __name__ == "__main__":
     strategy = FedAvgWithSave(
         min_fit_clients=1,
@@ -50,7 +48,7 @@ if __name__ == "__main__":
         min_available_clients=1,
     )
 
-    # 4 rounds = expect 4 sequential clients (one per round)
+    # 4 rounds = (optionally) 4 sequential clients
     fl.server.start_server(
         server_address="0.0.0.0:8080",
         config=fl.server.ServerConfig(num_rounds=4),
@@ -61,3 +59,5 @@ if __name__ == "__main__":
         save_final_model(strategy.final_parameters)
     else:
         print("[SERVER] ⚠️ No final parameters were found to save.")
+
+
