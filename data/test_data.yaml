@@ -1,0 +1,7 @@
+path: data/test_videos
+train: ../output/client1/train/images
+val: ../output/client1/val/images
+test: ../test_videos
+
+names:
+  0: object

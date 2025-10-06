@@ -48,7 +48,7 @@ def save_final_model(params, base_ckpt="model/my_model.pt", out_path="static/out
     return out_path
 
 
-# --- Test the saved global model on unseen videos + evaluate performance ---
+# --- Test-only: run final model on unseen videos and export results ---
 def test_final_model(model_path="static/output/final_model.pt",
                      test_videos_dir="data/test_videos",
                      save_dir="static/output/test_results_run1"):
@@ -57,49 +57,57 @@ def test_final_model(model_path="static/output/final_model.pt",
     model = YOLO(model_path)
     os.makedirs(save_dir, exist_ok=True)
 
-    # 1️⃣ Run inference on all test videos
+    summary_path = os.path.join(save_dir, "test_summary.txt")
+    summary_lines = ["=== TEST PERFORMANCE SUMMARY ===\n"]
+
+    # --- Video inference ---
     for fname in os.listdir(test_videos_dir):
         if fname.lower().endswith((".mp4", ".mov", ".avi", ".mkv")):
             src = os.path.join(test_videos_dir, fname)
             print(f"[SERVER] Inference on: {fname}")
-            model.predict(source=src, save=True, save_dir=save_dir, conf=0.25, verbose=True)
+            try:
+                model.predict(
+                    source=src,
+                    save=True,
+                    save_dir=os.path.join(save_dir, os.path.splitext(fname)[0]),
+                    conf=0.25,
+                    imgsz=640,
+                    stream=True,
+                    verbose=False
+                )
+                summary_lines.append(f"{fname}: Success\n")
+            except Exception as e:
+                print(f"[ERROR] Could not process {fname}: {e}")
+                summary_lines.append(f"{fname}: Failed ({e})\n")
 
-    # 2️⃣ Evaluate model performance (mAP, Precision, Recall)
-    print("\n[SERVER] Evaluating model performance on test dataset...")
-    metrics = model.val(split="val")  # Ultralytics built-in validation
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
-    results_summary = {
-        "Precision": round(metrics.box.p.mean().item(), 3),
-        "Recall": round(metrics.box.r.mean().item(), 3),
-        "mAP50": round(metrics.box.map50.mean().item(), 3),
-        "mAP50-95": round(metrics.box.map.mean().item(), 3),
-    }
+    # --- Evaluate performance metrics ---
+    try:
+        print("\n[SERVER] Evaluating model performance on test dataset...")
+        metrics = model.val(data="data/test_data.yaml", split="val")
 
-    print("\n📊 [SERVER] TEST PERFORMANCE SUMMARY")
-    for k, v in results_summary.items():
-        print(f"  {k:<10}: {v}")
+        results_summary = {
+            "Precision": round(metrics.box.p.mean().item(), 3),
+            "Recall": round(metrics.box.r.mean().item(), 3),
+            "mAP50": round(metrics.box.map50.mean().item(), 3),
+            "mAP50-95": round(metrics.box.map.mean().item(), 3),
+        }
 
-    # 3️⃣ Save metrics to TXT and CSV
-    metrics_txt = os.path.join(save_dir, "metrics_summary.txt")
-    metrics_csv = os.path.join(save_dir, "metrics_summary.csv")
-
-    with open(metrics_txt, "w") as f:
-        f.write("Test Performance Summary\n")
-        f.write("=========================\n")
+        summary_lines.append("\n--- Overall Metrics ---\n")
         for k, v in results_summary.items():
-            f.write(f"{k}: {v}\n")
+            summary_lines.append(f"{k:<10}: {v}\n")
 
-    with open(metrics_csv, "w") as f:
-        f.write("Metric,Value\n")
-        for k, v in results_summary.items():
-            f.write(f"{k},{v}\n")
+    except Exception as e:
+        summary_lines.append(f"\nMetrics evaluation skipped due to: {e}\n")
 
-    print(f"\n[SERVER] ✅ Metrics saved to:")
-    print(f"   - {metrics_txt}")
-    print(f"   - {metrics_csv}")
+    # --- Save test summary (UTF-8 safe) ---
+    with open(summary_path, "w", encoding="utf-8", errors="ignore") as f:
+        f.writelines(summary_lines)
 
-    print(f"\n[SERVER] Testing complete. Visual results saved to: {save_dir}")
-    return results_summary
+    print(f"\n📄 Test summary saved at: {summary_path}")
+    print(f"[SERVER] Visual results saved to: {save_dir}")
+    return summary_path
 
 
 def parse_args():
@@ -138,7 +146,6 @@ if __name__ == "__main__":
         strategy=strategy,
     )
 
-    # Save model + test after aggregation
     if strategy.final_parameters is not None:
         model_path = save_final_model(strategy.final_parameters, base_ckpt=args.base_ckpt, out_path=args.final_out)
         test_model_path = "static/output/final_model_eval.pt"
