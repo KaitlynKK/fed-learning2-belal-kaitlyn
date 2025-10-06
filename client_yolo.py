@@ -1,127 +1,97 @@
 import os
-import cv2
 import argparse
-from pathlib import Path
-from shutil import copy2
-import yaml
-import numpy as np
 import torch
 import flwr as fl
+from flwr.common import parameters_to_ndarrays
 from ultralytics import YOLO
 
-# -------- dataset prep from labeled_dir --------
-def prepare_from_labeled(labeled_dir: Path, train_folder: Path, val_folder: Path, split: float = 0.8):
-    img_dir = labeled_dir / "images"
-    lbl_dir = labeled_dir / "labels"
-    imgs = sorted([p for p in img_dir.glob("*.*") if p.suffix.lower() in {".jpg", ".jpeg", ".png"}])
-    if not imgs:
-        raise RuntimeError(f"No images found in {img_dir}. Expecting labeled dataset with images/ and labels/.")
+# --- Strategy that remembers last aggregated params ---
+class FedAvgWithSave(fl.server.strategy.FedAvg):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.final_parameters = None
 
-    split_idx = max(1, int(len(imgs) * split)) if len(imgs) > 1 else 1
-    sets = [("train", imgs[:split_idx]), ("val", imgs[split_idx:] or imgs[:1])]
+    def aggregate_fit(self, server_round, results, failures):
+        aggregated, metrics = super().aggregate_fit(server_round, results, failures)
+        if aggregated is not None:
+            self.final_parameters = aggregated
+        return aggregated, metrics
 
-    for split_name, items in sets:
-        dest_root = train_folder if split_name == "train" else val_folder
-        (dest_root / "images").mkdir(parents=True, exist_ok=True)
-        (dest_root / "labels").mkdir(parents=True, exist_ok=True)
-        for img in items:
-            lbl = lbl_dir / (img.stem + ".txt")
-            copy2(img, dest_root / "images" / img.name)
-            if lbl.exists():
-                copy2(lbl, dest_root / "labels" / lbl.name)
 
-# -------- helpers to move weights between Flower <-> PyTorch --------
-def state_dict_to_ndarrays(sd):
-    # Stable order by iterating over items()
-    return [v.detach().cpu().numpy() for _, v in sd.items()]
+def save_final_model(params, base_ckpt="model/my_model.pt", out_path="static/output/final_model.pt"):
+    print("[SERVER] Aggregation complete — saving model...")
 
-def ndarrays_to_state_dict_like(model, nds):
-    base_sd = model.model.state_dict()
-    if len(nds) != len(base_sd):
-        raise ValueError("Mismatched parameter count.")
+    base_model = YOLO(base_ckpt)
+    base_sd = base_model.model.state_dict()
+
+    ndarrays = parameters_to_ndarrays(params)
+    if len(ndarrays) != len(base_sd):
+        raise RuntimeError("Mismatched param counts! Check client get_parameters order.")
+
     new_sd = {}
-    for (k, v), arr in zip(base_sd.items(), nds):
+    for (k, v), arr in zip(base_sd.items(), ndarrays):
         t = torch.from_numpy(arr).to(v.device).to(v.dtype)
         if t.shape != v.shape:
-            raise ValueError(f"Shape mismatch for {k}: got {t.shape}, expected {v.shape}")
+            raise RuntimeError(f"Shape mismatch for {k}: got {t.shape}, expected {v.shape}")
         new_sd[k] = t
-    return new_sd
 
-# ---------------- Flower client ----------------
-class YOLOClient(fl.client.NumPyClient):
-    def __init__(self, args):
-        self.args = args
-        self.model = YOLO(args.model)  # MUST be same arch across all clients
-        self.labeled_dir = Path(args.labeled_dir)  # e.g., data/labelfront1
-        self.work_root = Path(args.work_root)      # e.g., output/client1
-        self.work_root.mkdir(parents=True, exist_ok=True)
+    base_model.model.load_state_dict(new_sd, strict=True)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    base_model.save(out_path)
+    print(f"[SERVER] Final global model saved at: {out_path}")
+    return out_path
 
-    def get_parameters(self, config):
-        return state_dict_to_ndarrays(self.model.model.state_dict())
 
-    def set_parameters(self, parameters):
-        new_sd = ndarrays_to_state_dict_like(self.model, parameters)
-        self.model.model.load_state_dict(new_sd, strict=True)
+# --- Test-only: evaluate final_model.pt on unseen videos ---
+def test_final_model(model_path="static/output/final_model.pt", test_videos_dir="data/test_videos"):
+    print("\n[SERVER] Testing final model on unseen videos (no training)...")
+    model = YOLO(model_path)
 
-    def fit(self, parameters, config):
-        print("[CLIENT] FIT STARTED")
-        if parameters:
-            self.set_parameters(parameters)
+    save_dir = "static/output/test_results"
+    os.makedirs(save_dir, exist_ok=True)
 
-        train_folder = self.work_root / "train"
-        val_folder = self.work_root / "val"
-        out_root = self.work_root / "runs"
-        for d in [train_folder, val_folder, out_root]:
-            d.mkdir(parents=True, exist_ok=True)
+    # Run inference on each test video
+    for fname in os.listdir(test_videos_dir):
+        if fname.lower().endswith((".mp4", ".mov", ".avi", ".mkv")):
+            src = os.path.join(test_videos_dir, fname)
+            print(f"[SERVER] Inference on: {fname}")
+            model.predict(source=src, save=True, save_dir=save_dir, imgsz=640, conf=0.25, verbose=True)
 
-        # Build train/val from labeled dir
-        prepare_from_labeled(self.labeled_dir, train_folder, val_folder, split=self.args.split)
+    print(f"\n[SERVER] Inference complete! Results saved to {save_dir}\n")
+    print("[SERVER] Evaluating accuracy (mAP, precision, recall)...")
 
-        # Write data.yaml
-        data_yaml_path = out_root / "data.yaml"
-        data_yaml = {
-            "train": str(train_folder.resolve()).replace("\\", "/"),
-            "val": str(val_folder.resolve()).replace("\\", "/"),
-            "nc": self.args.nc,
-            "names": self.args.names.split(","),
-        }
-        with open(data_yaml_path, "w") as f:
-            yaml.dump(data_yaml, f)
+    # Evaluate accuracy using labelled validation set (not test videos)
+    metrics = model.val(data="data/labelfront2", imgsz=640, conf=0.25, split="val")
+    print("\n[SERVER] === Performance Summary ===")
+    print(metrics)
 
-        # Train YOLO locally on this client's data
-        self.model.train(
-            data=str(data_yaml_path.resolve()),
-            epochs=self.args.epochs,
-            imgsz=self.args.imgsz,
-            project=str(out_root),
-            name="train_result",
-            exist_ok=True,
-            plots=True,
-            save=True,
-        )
-
-        # Return updated weights for aggregation
-        return self.get_parameters(config), 1, {}
-
-    def evaluate(self, parameters, config):
-        # optional: implement a proper val here
-        if parameters:
-            self.set_parameters(parameters)
-        return 0.0, 1, {}
 
 def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--server", default="localhost:8080")
-    p.add_argument("--model", default="model/my_model.pt", help="Base YOLO checkpoint")
-    p.add_argument("--labeled_dir", required=True, help="Path to labeled dataset (images/ & labels/)")
-    p.add_argument("--work_root", required=True, help="Client working dir for outputs")
-    p.add_argument("--epochs", type=int, default=5)
-    p.add_argument("--imgsz", type=int, default=640)
-    p.add_argument("--split", type=float, default=0.8)
-    p.add_argument("--nc", type=int, default=1)
-    p.add_argument("--names", default="object")
-    return p.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--num_rounds", type=int, default=4)
+    ap.add_argument("--test_videos_dir", default="data/test_videos")
+    ap.add_argument("--base_ckpt", default="model/my_model.pt")
+    ap.add_argument("--final_out", default="static/output/final_model.pt")
+    return ap.parse_args()
+
 
 if __name__ == "__main__":
     args = parse_args()
-    fl.client.start_numpy_client(server_address=args.server, client=YOLOClient(args))
+
+    strategy = FedAvgWithSave(
+        min_fit_clients=1,
+        min_evaluate_clients=1,
+        min_available_clients=1,
+    )
+
+    fl.server.start_server(
+        server_address="0.0.0.0:8080",
+        config=fl.server.ServerConfig(num_rounds=args.num_rounds),
+        strategy=strategy,
+    )
+
+    if strategy.final_parameters is not None:
+        model_path = save_final_model(strategy.final_parameters, base_ckpt=args.base_ckpt, out_path=args.final_out)
+        test_final_model(model_path, args.test_videos_dir)
+    else:
+        print("[SERVER] No parameters found after training.")
