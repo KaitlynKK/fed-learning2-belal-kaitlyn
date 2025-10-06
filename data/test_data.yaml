@@ -1,7 +1,7 @@
-path: data/test_videos
-train: ../output/client1/train/images
-val: ../output/client1/val/images
-test: ../test_videos
-
+# Auto-generated YOLO dataset for labelled test_videos (recursive)
+path: C:/fed-learning2-belal-kaitlyn/data/test_videos
+train: []
+val: C:/fed-learning2-belal-kaitlyn/data/_auto_test_list.txt
+nc: 1
 names:
-  0: object
+  - Train

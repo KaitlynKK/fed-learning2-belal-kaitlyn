@@ -1,14 +1,19 @@
 import os
 import argparse
+import shutil
+from datetime import datetime
+from pathlib import Path
+from typing import List
+
 import torch
 import flwr as fl
 from flwr.common import parameters_to_ndarrays
 from ultralytics import YOLO
-import shutil
-from datetime import datetime
 
 
-# --- Strategy that remembers the last aggregated parameters ---
+# ----------------------------
+# Flower strategy with saved params
+# ----------------------------
 class FedAvgWithSave(fl.server.strategy.FedAvg):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -21,8 +26,13 @@ class FedAvgWithSave(fl.server.strategy.FedAvg):
         return aggregated, metrics
 
 
-def save_final_model(params, base_ckpt="model/my_model.pt", out_path="static/output/final_model.pt"):
-    print("[SERVER] Aggregation complete, saving model...")
+# ----------------------------
+# Save aggregated parameters into a YOLO checkpoint
+# ----------------------------
+def save_final_model(params,
+                     base_ckpt: str = "model/my_model.pt",
+                     out_path: str = "static/output/final_model.pt") -> str:
+    print("[SERVER] Aggregation complete — saving model...")
 
     base_model = YOLO(base_ckpt)
     base_sd = base_model.model.state_dict()
@@ -38,107 +48,207 @@ def save_final_model(params, base_ckpt="model/my_model.pt", out_path="static/out
     for (k, v), arr in zip(base_sd.items(), ndarrays):
         t = torch.from_numpy(arr).to(v.device).to(v.dtype)
         if t.shape != v.shape:
-            raise RuntimeError(f"Shape mismatch for {k}: got {t.shape}, expected {v.shape}")
+            raise RuntimeError(f"Shape mismatch for '{k}': got {t.shape}, expected {v.shape}")
         new_sd[k] = t
 
     base_model.model.load_state_dict(new_sd, strict=True)
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     base_model.save(out_path)
-    print(f"[SERVER] Final model saved to: {out_path}")
+    print(f"[SERVER] Final global model saved at: {out_path}")
     return out_path
 
 
-# --- Test-only: run final model on unseen videos and export results ---
-def test_final_model(model_path="static/output/final_model.pt",
-                     test_videos_dir="data/test_videos",
-                     save_dir="static/output/test_results_run1"):
+# ----------------------------
+# Utilities for testing
+# ----------------------------
+VIDEO_EXTS: List[str] = [".mp4", ".mov", ".avi", ".mkv"]
 
-    print("[SERVER] Testing final model on unseen videos...")
+
+def ensure_test_yaml(test_root: Path,
+                     yaml_path: Path = Path("data/test_data.yaml"),
+                     classes_file_candidates=None) -> Path:
+    """
+    Build a data.yaml that points 'val' to a text file listing ALL images found
+    under test_root/**/images/*.jpg|png|jpeg. Uses forward slashes to avoid YAML
+    escape issues on Windows.
+    """
+    test_root = test_root.resolve()
+    yaml_path = yaml_path.resolve()
+
+    # Class names
+    names = None
+    if classes_file_candidates is None:
+        classes_file_candidates = [
+            test_root / "classes.txt",
+            Path("data/classes.txt"),
+            Path("classes.txt"),
+        ]
+    for c in classes_file_candidates:
+        if c.exists():
+            with open(c, "r", encoding="utf-8", errors="ignore") as f:
+                names = [line.strip() for line in f if line.strip()]
+            break
+    if not names:
+        names = ["object"]
+
+    # Collect images recursively
+    exts = {".jpg", ".jpeg", ".png", ".bmp"}
+    imgs: list[str] = []
+    for root, _, files in os.walk(test_root):
+        if os.path.basename(root).lower() == "images":
+            for fn in files:
+                if Path(fn).suffix.lower() in exts:
+                    p = Path(root, fn).resolve()
+                    imgs.append(p.as_posix())  # <-- forward slashes
+
+    if not imgs:
+        raise FileNotFoundError(f"No images found under {test_root}")
+
+    # List file next to YAML
+    list_file = yaml_path.with_name("_auto_test_list.txt")
+    list_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(list_file, "w", encoding="utf-8") as f:
+        f.write("\n".join(imgs))
+
+    # Normalize paths for YAML
+    test_root_posix = test_root.as_posix()
+    list_file_posix = list_file.as_posix()
+
+    # Write YAML (single quotes also fine, but posix avoids escapes)
+    content = (
+        "# Auto-generated YOLO dataset for labelled test_videos (recursive)\n"
+        f"path: {test_root_posix}\n"
+        "train: []\n"
+        f"val: {list_file_posix}\n"
+        f"nc: {len(names)}\n"
+        "names:\n" + "".join(f"  - {n}\n" for n in names)
+    )
+    with open(yaml_path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    return yaml_path
+
+
+def test_final_model(model_path: str = "static/output/final_model.pt",
+                     test_videos_dir: str = "data/test_videos",
+                     save_dir: str | None = None,
+                     test_yaml_path: str = "data/test_data.yaml") -> str:
+    """
+    - Runs inference on each video file in test_videos_dir (stream=True, recursive).
+    - Evaluates metrics on the labelled test_videos/images + labels via test_data.yaml.
+    """
+    model_path = str(Path(model_path).resolve())
+    test_videos_dir = str(Path(test_videos_dir).resolve())
+    if save_dir is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_dir = str(Path(f"static/output/test_results_{timestamp}").resolve())
+
+    Path(save_dir).mkdir(parents=True, exist_ok=True)
+
+    print("\n[SERVER] Testing final model on unseen videos...")
     model = YOLO(model_path)
-    os.makedirs(save_dir, exist_ok=True)
 
-    summary_path = os.path.join(save_dir, "test_summary.txt")
-    summary_lines = ["=== TEST PERFORMANCE SUMMARY ===\n"]
+    # --- Video inference (visuals) with stream=True
+    for root, _, files in os.walk(test_videos_dir):
+        for fname in files:
+            if Path(fname).suffix.lower() in VIDEO_EXTS:
+                src = str(Path(root) / fname)
+                rel = Path(root).relative_to(test_videos_dir)
+                out_dir = str(Path(save_dir) / rel / Path(fname).stem)
+                print(f"[SERVER] Inference on: {Path(rel) / fname}")
+                try:
+                    preds = model.predict(
+                        source=src,
+                        save=True,
+                        save_dir=out_dir,
+                        imgsz=640,
+                        conf=0.25,
+                        stream=True,
+                        verbose=False,
+                        vid_stride=1
+                    )
+                    for _ in preds:  # consume generator
+                        pass
+                except Exception as e:
+                    print(f"[SERVER][WARN] Could not process {fname}: {e}")
+                finally:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
-    # --- Video inference ---
-    for fname in os.listdir(test_videos_dir):
-        if fname.lower().endswith((".mp4", ".mov", ".avi", ".mkv")):
-            src = os.path.join(test_videos_dir, fname)
-            print(f"[SERVER] Inference on: {fname}")
-            try:
-                model.predict(
-                    source=src,
-                    save=True,
-                    save_dir=os.path.join(save_dir, os.path.splitext(fname)[0]),
-                    conf=0.25,
-                    imgsz=640,
-                    stream=True,
-                    verbose=False
-                )
-                summary_lines.append(f"{fname}: Success\n")
-            except Exception as e:
-                print(f"[ERROR] Could not process {fname}: {e}")
-                summary_lines.append(f"{fname}: Failed ({e})\n")
+    # --- Metrics
+    summary_path = str(Path(save_dir) / "test_summary.txt")
+    lines = ["=== TEST PERFORMANCE SUMMARY ===\n"]
+    for root, _, files in os.walk(test_videos_dir):
+        for fname in files:
+            if Path(fname).suffix.lower() in VIDEO_EXTS:
+                rel = Path(root).relative_to(test_videos_dir)
+                lines.append(f"{Path(rel) / fname}: Success\n")
 
-            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    def _to_float(x):
+        try:
+            if hasattr(x, "item"): return float(x.item())
+            if hasattr(x, "mean"):
+                m = x.mean()
+                return float(m.item()) if hasattr(m, "item") else float(m)
+            if isinstance(x, (list, tuple)) and len(x) > 0:
+                return float(sum(map(_to_float, x)) / len(x))
+            return float(x)
+        except Exception:
+            return float("nan")
 
-    # --- Evaluate performance metrics ---
     try:
-        print("\n[SERVER] Evaluating model performance on test dataset...")
-        metrics = model.val(data="data/test_data.yaml", split="val")
+        print("\n[SERVER] Evaluating model performance on labelled test_videos...")
+        yaml_abs = ensure_test_yaml(test_root=Path(test_videos_dir), yaml_path=Path(test_yaml_path))
+        metrics = model.val(data=str(yaml_abs), imgsz=640, conf=0.25, split="val")
 
-        results_summary = {
-            "Precision": round(metrics.box.p.mean().item(), 3),
-            "Recall": round(metrics.box.r.mean().item(), 3),
-            "mAP50": round(metrics.box.map50.mean().item(), 3),
-            "mAP50-95": round(metrics.box.map.mean().item(), 3),
-        }
+        p, r = _to_float(getattr(metrics.box, "p", float("nan"))), _to_float(getattr(metrics.box, "r", float("nan")))
+        map50, map5095 = _to_float(getattr(metrics.box, "map50", float("nan"))), _to_float(getattr(metrics.box, "map", float("nan")))
 
-        summary_lines.append("\n--- Overall Metrics ---\n")
-        for k, v in results_summary.items():
-            summary_lines.append(f"{k:<10}: {v}\n")
+        lines.append("\n--- Overall Metrics (labelled test_videos) ---\n")
+        lines.append(f"Precision : {p:.3f}\n")
+        lines.append(f"Recall    : {r:.3f}\n")
+        lines.append(f"mAP50     : {map50:.3f}\n")
+        lines.append(f"mAP50-95  : {map5095:.3f}\n")
 
     except Exception as e:
-        summary_lines.append(f"\nMetrics evaluation skipped due to: {e}\n")
+        lines.append(f"\nMetrics evaluation skipped due to: {e}\n")
 
-    # --- Save test summary (UTF-8 safe) ---
-    with open(summary_path, "w", encoding="utf-8", errors="ignore") as f:
-        f.writelines(summary_lines)
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.writelines(lines)
 
     print(f"\n📄 Test summary saved at: {summary_path}")
-    print(f"[SERVER] Visual results saved to: {save_dir}")
+    print(f"[SERVER] Visual results saved to: {save_dir}\n")
     return summary_path
 
 
+# ----------------------------
+# CLI
+# ----------------------------
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--num_rounds", type=int, default=4)
-    ap.add_argument("--test_videos_dir", default="data/test_videos")
     ap.add_argument("--base_ckpt", default="model/my_model.pt")
     ap.add_argument("--final_out", default="static/output/final_model.pt")
-    ap.add_argument("--test_only", action="store_true", help="Run testing only on final model without training")
+    ap.add_argument("--test_videos_dir", default="data/test_videos")
+    ap.add_argument("--test_yaml", default="data/test_data.yaml")
+    ap.add_argument("--test_only", action="store_true")
     return ap.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
 
-    # ✅ TEST-ONLY MODE
     if args.test_only:
         print("[SERVER] Running in TEST-ONLY mode.")
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        save_dir = f"static/output/test_results_{timestamp}"
-        os.makedirs(save_dir, exist_ok=True)
-        test_final_model(model_path=args.final_out, test_videos_dir=args.test_videos_dir, save_dir=save_dir)
-        print(f"[SERVER] Test-only run completed. Results in: {save_dir}")
-        exit(0)
+        test_final_model(
+            model_path=args.final_out,
+            test_videos_dir=args.test_videos_dir,
+            test_yaml_path=args.test_yaml,
+        )
+        print("[SERVER] Test-only run completed.")
+        raise SystemExit(0)
 
-    # ✅ NORMAL FEDERATED TRAINING MODE
-    strategy = FedAvgWithSave(
-        min_fit_clients=1,
-        min_evaluate_clients=1,
-        min_available_clients=1,
-    )
+    strategy = FedAvgWithSave(min_fit_clients=1, min_evaluate_clients=1, min_available_clients=1)
 
     fl.server.start_server(
         server_address="0.0.0.0:8080",
@@ -146,17 +256,24 @@ if __name__ == "__main__":
         strategy=strategy,
     )
 
-    if strategy.final_parameters is not None:
-        model_path = save_final_model(strategy.final_parameters, base_ckpt=args.base_ckpt, out_path=args.final_out)
-        test_model_path = "static/output/final_model_eval.pt"
-        shutil.copy(model_path, test_model_path)
-        print(f"[SERVER] Copied model to test-only file: {test_model_path}")
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        test_results_dir = f"static/output/test_results_{timestamp}"
-        os.makedirs(test_results_dir, exist_ok=True)
-
-        test_final_model(model_path=test_model_path, test_videos_dir=args.test_videos_dir, save_dir=test_results_dir)
-        print(f"[SERVER] Test results saved in: {test_results_dir}")
-    else:
+    if strategy.final_parameters is None:
         print("[SERVER] No final parameters were found to save.")
+        raise SystemExit(0)
+
+    model_path = save_final_model(
+        params=strategy.final_parameters,
+        base_ckpt=args.base_ckpt,
+        out_path=args.final_out,
+    )
+
+    eval_copy = Path("static/output/final_model_eval.pt")
+    eval_copy.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(model_path, eval_copy)
+    print(f"[SERVER] Copied model to: {eval_copy}")
+
+    test_final_model(
+        model_path=str(eval_copy),
+        test_videos_dir=args.test_videos_dir,
+        test_yaml_path=args.test_yaml,
+    )
+

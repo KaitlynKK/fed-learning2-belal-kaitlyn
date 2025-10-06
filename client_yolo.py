@@ -1,6 +1,7 @@
 import os
 import argparse
 import torch
+from pathlib import Path
 import flwr as fl
 from flwr.common import parameters_to_ndarrays
 from ultralytics import YOLO
@@ -42,28 +43,77 @@ def save_final_model(params, base_ckpt="model/my_model.pt", out_path="static/out
     return out_path
 
 
-# --- Test-only: evaluate final_model.pt on unseen videos ---
-def test_final_model(model_path="static/output/final_model.pt", test_videos_dir="data/test_videos"):
-    print("\n[SERVER] Testing final model on unseen videos (no training)...")
-    model = YOLO(model_path)
+# --- Test-only: run final model on unseen videos and export results ---
+def test_final_model(model_path="static/output/final_model.pt",
+                     test_videos_dir="data/test_videos",
+                     save_dir="static/output/test_results_run1"):
 
-    save_dir = "static/output/test_results"
+    print("[SERVER] Testing final model on unseen videos...")
+    model = YOLO(model_path)
     os.makedirs(save_dir, exist_ok=True)
 
-    # Run inference on each test video
+    summary_path = os.path.join(save_dir, "test_summary.txt")
+    summary_lines = ["=== TEST PERFORMANCE SUMMARY ===\n"]
+
+        # --- Video inference (visuals)
     for fname in os.listdir(test_videos_dir):
-        if fname.lower().endswith((".mp4", ".mov", ".avi", ".mkv")):
-            src = os.path.join(test_videos_dir, fname)
+        if Path(fname).suffix.lower() in VIDEO_EXTS:
+            src = str(Path(test_videos_dir) / fname)
+            out_dir = str(Path(save_dir) / Path(fname).stem)
             print(f"[SERVER] Inference on: {fname}")
-            model.predict(source=src, save=True, save_dir=save_dir, imgsz=640, conf=0.25, verbose=True)
+            try:
+                # stream=True prevents results from piling up in RAM
+                preds = model.predict(
+                    source=src,
+                    save=True,
+                    save_dir=out_dir,
+                    imgsz=640,
+                    conf=0.25,
+                    stream=True,   # ✅ added
+                    verbose=False,
+                    vid_stride=1   # optional: skip frames for faster processing
+                )
+                # consume the generator so frames are processed and then released
+                for _ in preds:
+                    pass
+            except Exception as e:
+                print(f"[SERVER][WARN] Could not process {fname}: {e}")
+            finally:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
-    print(f"\n[SERVER] Inference complete! Results saved to {save_dir}\n")
-    print("[SERVER] Evaluating accuracy (mAP, precision, recall)...")
 
-    # Evaluate accuracy using labelled validation set (not test videos)
-    metrics = model.val(data="data/labelfront2", imgsz=640, conf=0.25, split="val")
-    print("\n[SERVER] === Performance Summary ===")
-    print(metrics)
+    # --- Evaluate performance metrics on labelled dataset ---
+    try:
+        from pathlib import Path
+        print("\n[SERVER] Evaluating model performance on labelled dataset (labelfront2)...")
+
+        # Use absolute path so Ultralytics doesn’t prepend datasets_dir
+        data_yaml = str(Path("data/labelfront2/data.yaml").resolve())
+
+        metrics = model.val(data=data_yaml, imgsz=640, conf=0.25, split="val")
+
+        results_summary = {
+            "Precision": round(metrics.box.p.mean().item(), 3),
+            "Recall": round(metrics.box.r.mean().item(), 3),
+            "mAP50": round(metrics.box.map50.mean().item(), 3),
+            "mAP50-95": round(metrics.box.map.mean().item(), 3),
+        }
+
+        summary_lines.append("\n--- Overall Metrics ---\n")
+        for k, v in results_summary.items():
+            summary_lines.append(f"{k:<10}: {v}\n")
+
+    except Exception as e:
+        summary_lines.append(f"\nMetrics evaluation skipped due to: {e}\n")
+
+    # --- Save test summary ---
+    with open(summary_path, "w", encoding="utf-8", errors="ignore") as f:
+        f.writelines(summary_lines)
+
+    print(f"\n📄 Test summary saved at: {summary_path}")
+    print(f"[SERVER] Visual results saved to: {save_dir}")
+    return summary_path
 
 
 def parse_args():

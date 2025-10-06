@@ -1,0 +1,6 @@
+=== TEST PERFORMANCE SUMMARY ===
+
+Metrics evaluation skipped due to: while parsing a quoted scalar
+  in "<unicode string>", line 2, column 7
+found unknown escape character
+  in "<unicode string>", line 2, column 38

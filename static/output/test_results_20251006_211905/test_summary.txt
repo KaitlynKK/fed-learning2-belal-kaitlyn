@@ -1,0 +1,7 @@
+=== TEST PERFORMANCE SUMMARY ===
+
+--- Overall Metrics (labelled test_videos) ---
+Precision : 1.000
+Recall    : 0.005
+mAP50     : 0.502
+mAP50-95  : 0.427
