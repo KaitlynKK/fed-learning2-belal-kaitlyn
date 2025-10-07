@@ -1,262 +1,284 @@
+# server_yolo.py — Flower YOLOv8 server with test-only mode and proper evaluation
+
+import os
 import argparse
-import random
+from datetime import datetime
 from pathlib import Path
-from shutil import copy2
-from typing import Dict, List, Tuple
+from typing import List, Dict
 
-import flwr as fl
-import numpy as np
 import torch
-import yaml
+import flwr as fl
+from flwr.common import parameters_to_ndarrays
 from ultralytics import YOLO
+import yaml
 
 
-# Dataset preparation helpers
-def prepare_from_labeled(
-    labeled_dir: Path,
-    train_dir: Path,
-    val_dir: Path,
-    split: float = 0.8,
-    seed: int | None = 42,
-) -> Tuple[int, int]:
-    """
-    Copy images and labels from a labeled_dir structured as:
-      labeled_dir/
-        images/*.jpg|.png
-        labels/*.txt     (YOLO format)
-    into train_dir and val_dir, each with images/ and labels/.
+# ----------------------------
+# Strategy that remembers last aggregated params
+# ----------------------------
+class FedAvgWithSave(fl.server.strategy.FedAvg):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.final_parameters = None
 
-    Returns: (num_train_images, num_val_images)
-    """
-    img_dir = labeled_dir / "images"
-    lbl_dir = labeled_dir / "labels"
+    def aggregate_fit(self, server_round, results, failures):
+        aggregated, metrics = super().aggregate_fit(server_round, results, failures)
+        if aggregated is not None:
+            self.final_parameters = aggregated
+        return aggregated, metrics
 
-    imgs = sorted([p for p in img_dir.glob("*.*") if p.suffix.lower() in {".jpg", ".jpeg", ".png"}])
-    if not imgs:
+
+# ----------------------------
+# Save aggregated parameters into a YOLO checkpoint
+# ----------------------------
+def save_final_model(
+    params,
+    base_ckpt: str = "model/my_model.pt",
+    out_path: str = "static/output/final_model.pt",
+) -> str:
+    print("[SERVER] Aggregation complete — saving model...")
+
+    base_model = YOLO(base_ckpt)
+    base_sd = base_model.model.state_dict()  # OrderedDict of tensors
+
+    ndarrays = parameters_to_ndarrays(params)
+    if len(ndarrays) != len(base_sd):
         raise RuntimeError(
-            f"No images found in {img_dir}. Expecting labeled dataset with images/ and labels/."
+            f"Mismatched param counts: agg={len(ndarrays)} vs model={len(base_sd)}. "
+            "Ensure each client get_parameters()/set_parameters uses a stable key order."
         )
 
-    # ✅ Shuffle before splitting (optionally seeded for reproducibility)
-    if seed is not None:
-        random.seed(seed)
-    random.shuffle(imgs)
+    new_sd: Dict[str, torch.Tensor] = {}
+    for (k, v), arr in zip(base_sd.items(), ndarrays):
+        t = torch.from_numpy(arr).to(v.device).to(v.dtype)
+        if t.shape != v.shape:
+            raise RuntimeError(f"Shape mismatch for '{k}': got {t.shape}, expected {v.shape}")
+        new_sd[k] = t
 
-    split_idx = max(1, int(len(imgs) * split)) if len(imgs) > 1 else 1
-    train_imgs = imgs[:split_idx]
-    val_imgs = imgs[split_idx:] or imgs[:1]  # ensure at least one val image
-
-    for dest_root, subset in [(train_dir, train_imgs), (val_dir, val_imgs)]:
-        (dest_root / "images").mkdir(parents=True, exist_ok=True)
-        (dest_root / "labels").mkdir(parents=True, exist_ok=True)
-        for img in subset:
-            # copy image
-            copy2(img, dest_root / "images" / img.name)
-            # matching label
-            lbl = lbl_dir / (img.stem + ".txt")
-            if lbl.exists():
-                copy2(lbl, dest_root / "labels" / lbl.name)
-            else:
-                # if a label is missing, create an empty one (optional)
-                (dest_root / "labels" / (img.stem + ".txt")).write_text("", encoding="utf-8")
-
-    return len(train_imgs), len(val_imgs)
+    base_model.model.load_state_dict(new_sd, strict=True)
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    # Save as a standard Ultralytics checkpoint path; YOLO().save() supports file path
+    base_model.save(out_path)
+    print(f"[SERVER] Final global model saved at: {out_path}")
+    return out_path
 
 
-def write_data_yaml(
-    root: Path, train_dir: Path, val_dir: Path, nc: int, names: List[str]
+# ----------------------------
+# Test helpers
+# ----------------------------
+VIDEO_EXTS: List[str] = [".mp4", ".mov", ".avi", ".mkv"]
+
+
+def ensure_test_yaml(
+    test_root: Path,
+    yaml_path: Path = Path("data/test_data.yaml"),
+    class_names: List[str] | None = None,
 ) -> Path:
     """
-    Write a minimal Ultralytics data.yaml pointing to train/val folders.
+    Build a YOLO data.yaml that points 'val' to a list of ALL images found under:
+      test_root/**/images/*.jpg|png|jpeg
+    Assumes matching labels live at test_root/**/labels/<same_stem>.txt
+
+    On Windows, writes POSIX-style paths to avoid YAML escape issues.
     """
-    data = {
-        "path": str(root.resolve()).replace("\\", "/"),
-        "train": str(train_dir.resolve()).replace("\\", "/"),
-        "val": str(val_dir.resolve()).replace("\\", "/"),
-        "nc": nc,
-        "names": names,
+    test_root = test_root.resolve()
+    yaml_path = yaml_path.resolve()
+
+    if class_names is None or len(class_names) == 0:
+        class_names = ["object"]  # default single-class
+
+    # collect images recursively only from 'images' folders
+    exts = {".jpg", ".jpeg", ".png", ".bmp"}
+    imgs: list[str] = []
+    for root, _, files in os.walk(test_root):
+        if os.path.basename(root).lower() == "images":
+            for fn in files:
+                if Path(fn).suffix.lower() in exts:
+                    p = Path(root, fn).resolve()
+                    imgs.append(p.as_posix())
+
+    if not imgs:
+        raise FileNotFoundError(f"No images found under {test_root}/**/images")
+
+    # write list file next to yaml
+    list_file = yaml_path.with_name("_auto_test_list.txt")
+    list_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(list_file, "w", encoding="utf-8") as f:
+        f.write("\n".join(imgs))
+
+    # write YAML with only 'val' populated
+    content = {
+        "path": test_root.as_posix(),
+        "train": [],
+        "val": list_file.as_posix(),
+        "nc": len(class_names),
+        "names": class_names,
     }
-    yaml_path = root / "data.yaml"
     with open(yaml_path, "w", encoding="utf-8") as f:
-        yaml.safe_dump(data, f, sort_keys=False)
+        yaml.safe_dump(content, f, sort_keys=False)
     return yaml_path
 
 
-# Flower <-> YOLO param bridge
-def state_dict_to_ndarrays(sd: Dict[str, torch.Tensor]) -> List[np.ndarray]:
-    # Keep a stable order by iterating over .items() of the actual state_dict
-    return [v.detach().cpu().numpy() for _, v in sd.items()]
+def test_final_model(
+    model_path: str = "static/output/final_model.pt",
+    test_videos_dir: str = "data/test_videos",
+    save_dir: str | None = None,
+    test_yaml_path: str = "data/test_data.yaml",
+    visuals_conf: float = 0.25,  # only for saving pretty videos; NOT used for metrics
+) -> str:
+    """
+    - Runs inference on each video file in test_videos_dir (optional visuals with stream=True).
+    - Evaluates metrics on labelled frames under test_videos/**/images + labels using a generated data.yaml.
+    - IMPORTANT: We do NOT clamp 'conf' during model.val(); we use defaults so recall/mAP are computed properly.
+    """
+    model_path = str(Path(model_path).resolve())
+    test_videos_dir = str(Path(test_videos_dir).resolve())
+    if save_dir is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_dir = str(Path(f"static/output/test_results_{timestamp}").resolve())
+    Path(save_dir).mkdir(parents=True, exist_ok=True)
+
+    print("\n[SERVER] Testing final model on unseen videos...")
+    model = YOLO(model_path)
+
+    # --- Video inference visuals (optional, uses a typical runtime conf like 0.25)
+    for root, _, files in os.walk(test_videos_dir):
+        for fname in files:
+            if Path(fname).suffix.lower() in VIDEO_EXTS:
+                src = str(Path(root) / fname)
+                rel = Path(root).relative_to(test_videos_dir)
+                out_dir = str(Path(save_dir) / rel / Path(fname).stem)
+                print(f"[SERVER] Inference on: {Path(rel) / fname}")
+                try:
+                    preds = model.predict(
+                        source=src,
+                        save=True,
+                        save_dir=out_dir,
+                        imgsz=640,
+                        conf=visuals_conf,
+                        stream=True,     # don't keep frames in RAM
+                        verbose=False,
+                        vid_stride=1,    # adjust if you want to skip frames
+                    )
+                    # consume generator
+                    for _ in preds:
+                        pass
+                except Exception as e:
+                    print(f"[SERVER][WARN] Could not process {fname}: {e}")
+                finally:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+    # --- Metrics summary
+    summary_path = str(Path(save_dir) / "test_summary.txt")
+    lines = ["=== TEST PERFORMANCE SUMMARY ===\n"]
+    for root, _, files in os.walk(test_videos_dir):
+        for fname in files:
+            if Path(fname).suffix.lower() in VIDEO_EXTS:
+                rel = Path(root).relative_to(test_videos_dir)
+                lines.append(f"{Path(rel) / fname}: processed\n")
+
+    try:
+        print("\n[SERVER] Evaluating model performance on labelled test_videos...")
+        yaml_abs = ensure_test_yaml(test_root=Path(test_videos_dir), yaml_path=Path(test_yaml_path))
+        # ⚠️ DO NOT pass a high 'conf' here — let Ultralytics sweep properly
+        metrics = model.val(data=str(yaml_abs), imgsz=640)
+
+        # Extract key metrics safely
+        def _to_float(x):
+            try:
+                if hasattr(x, "item"):
+                    return float(x.item())
+                if hasattr(x, "mean"):
+                    m = x.mean()
+                    return float(m.item()) if hasattr(m, "item") else float(m)
+                if isinstance(x, (list, tuple)) and len(x) > 0:
+                    return float(sum(map(_to_float, x)) / len(x))
+                return float(x)
+            except Exception:
+                return float("nan")
+
+        p = _to_float(getattr(metrics.box, "p", float("nan")))
+        r = _to_float(getattr(metrics.box, "r", float("nan")))
+        map50 = _to_float(getattr(metrics.box, "map50", float("nan")))
+        map5095 = _to_float(getattr(metrics.box, "map", float("nan")))
+
+        lines.append("\n--- Overall Metrics (labelled test_videos) ---\n")
+        lines.append(f"Precision : {p:.3f}\n")
+        lines.append(f"Recall    : {r:.3f}\n")
+        lines.append(f"mAP50     : {map50:.3f}\n")
+        lines.append(f"mAP50-95  : {map5095:.3f}\n")
+
+    except Exception as e:
+        lines.append(f"\nMetrics evaluation skipped due to: {e}\n")
+
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+
+    print(f"\n📄 Test summary saved at: {summary_path}")
+    print(f"[SERVER] Visual results saved to: {save_dir}\n")
+    return summary_path
 
 
-def ndarrays_to_state_dict(keys: List[str], nds: List[np.ndarray], ref_sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    if len(keys) != len(nds):
-        raise RuntimeError(f"Param length mismatch: keys={len(keys)} vs nds={len(nds)}")
-    out: Dict[str, torch.Tensor] = {}
-    for k, arr in zip(keys, nds):
-        ref_t = ref_sd[k]
-        t = torch.from_numpy(arr).to(ref_t.device).to(ref_t.dtype)
-        if t.shape != ref_t.shape:
-            raise RuntimeError(f"Shape mismatch for '{k}': got {t.shape}, expected {ref_t.shape}")
-        out[k] = t
-    return out
-
-
-# Flower client
-class YOLOFlowerClient(fl.client.NumPyClient):
-    def __init__(
-        self,
-        base_ckpt: Path,
-        work_root: Path,
-        labeled_dir: Path,
-        split: float,
-        epochs: int,
-        imgsz: int,
-        nc: int,
-        names: List[str],
-        seed: int | None,
-    ):
-        self.base_ckpt = base_ckpt
-        self.work_root = work_root
-        self.labeled_dir = labeled_dir
-        self.split = split
-        self.epochs = epochs
-        self.imgsz = imgsz
-        self.nc = nc
-        self.names = names
-        self.seed = seed
-
-        self.work_root.mkdir(parents=True, exist_ok=True)
-        self.train_dir = work_root / "train"
-        self.val_dir = work_root / "val"
-        self.train_dir.mkdir(parents=True, exist_ok=True)
-        self.val_dir.mkdir(parents=True, exist_ok=True)
-
-        # Prepare dataset (shuffled 80/20)
-        ntr, nval = prepare_from_labeled(
-            labeled_dir=self.labeled_dir,
-            train_dir=self.train_dir,
-            val_dir=self.val_dir,
-            split=self.split,
-            seed=self.seed,
-        )
-        print(f"[CLIENT] Prepared dataset: train={ntr}, val={nval}")
-
-        # data.yaml
-        self.data_yaml = write_data_yaml(
-            root=self.work_root,
-            train_dir=self.train_dir,
-            val_dir=self.val_dir,
-            nc=self.nc,
-            names=self.names,
-        )
-        print(f"[CLIENT] data.yaml -> {self.data_yaml}")
-
-        # Load YOLO
-        self.model = YOLO(str(self.base_ckpt))
-        # Capture a stable list of state_dict keys/ordering
-        self._keys = list(self.model.model.state_dict().keys())
-
-    # --- Flower API ---
-    def get_parameters(self, config):
-        sd = self.model.model.state_dict()
-        return state_dict_to_ndarrays(sd)
-
-    def set_parameters(self, parameters: List[np.ndarray]):
-        ref_sd = self.model.model.state_dict()
-        new_sd = ndarrays_to_state_dict(self._keys, parameters, ref_sd)
-        self.model.model.load_state_dict(new_sd, strict=True)
-
-    def fit(self, parameters, config):
-        # Receive global params
-        self.set_parameters(parameters)
-
-        # Train
-        print(f"[CLIENT] Training for {self.epochs} epochs @ {self.imgsz}px")
-        self.model.train(
-            data=str(self.data_yaml),
-            epochs=self.epochs,
-            imgsz=self.imgsz,
-            # You can add batch, lr, etc. if needed
-            verbose=True,
-        )
-
-        # Load best (Ultralytics saves 'best.pt' in runs/detect/train*/weights)
-        # We’ll reload from the most recent run:
-        last_run = sorted((Path("runs/detect").glob("train*")), key=lambda p: p.stat().st_mtime)[-1]
-        best_ckpt = last_run / "weights" / "best.pt"
-        if best_ckpt.exists():
-            self.model = YOLO(str(best_ckpt))
-            print(f"[CLIENT] Reloaded best checkpoint: {best_ckpt}")
-        else:
-            print("[CLIENT][WARN] best.pt not found, sending current weights")
-
-        # Return updated params
-        sd = self.model.model.state_dict()
-        metrics = {"train_epochs": float(self.epochs)}
-        return state_dict_to_ndarrays(sd), len(list(self.train_dir.glob("images/*"))), metrics
-
-    def evaluate(self, parameters, config):
-        # Receive latest global params
-        self.set_parameters(parameters)
-
-        # Evaluate on our local validation split
-        # IMPORTANT: don't set a high conf during mAP/recall evaluation
-        results = self.model.val(data=str(self.data_yaml), imgsz=self.imgsz)
-        # Ultralytics returns rich metrics; we extract main ones
-        p = float(results.box.p.mean().item())
-        r = float(results.box.r.mean().item())
-        map50 = float(results.box.map50.mean().item())
-        map5095 = float(results.box.map.mean().item())
-
-        metrics = {
-            "precision": p,
-            "recall": r,
-            "map50": map50,
-            "map50_95": map5095,
-        }
-        num_val = len(list(self.val_dir.glob("images/*")))
-        print(f"[CLIENT] Eval -> P:{p:.3f} R:{r:.3f} mAP50:{map50:.3f} mAP50-95:{map5095:.3f}")
-        # Flower expects (loss, num_examples, metrics)
-        # If no loss available, return 0.0 (or results.box.map as a proxy negated).
-        return 0.0, num_val, metrics
-
-
+# ----------------------------
 # CLI
+# ----------------------------
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--server", default="localhost:8080", help="Flower server host:port")
-    ap.add_argument("--model", default="model/my_model.pt", help="Base YOLO checkpoint path")
-    ap.add_argument("--labeled_dir", default="data/labelfront2", help="Labeled dataset root (images/, labels/)")
-    ap.add_argument("--work_root", default="output/client1", help="Client working dir")
-    ap.add_argument("--epochs", type=int, default=5)
-    ap.add_argument("--imgsz", type=int, default=640)
-    ap.add_argument("--split", type=float, default=0.8)
-    ap.add_argument("--nc", type=int, default=1)
-    ap.add_argument("--names", nargs="*", default=["object"])
-    ap.add_argument("--seed", type=int, default=42)  # set to -1 to make it None (fully random)
+    ap.add_argument("--num_rounds", type=int, default=4)
+    ap.add_argument("--base_ckpt", default="model/my_model.pt")
+    ap.add_argument("--final_out", default="static/output/final_model.pt")
+    ap.add_argument("--test_videos_dir", default="data/test_videos")
+    ap.add_argument("--test_yaml", default="data/test_data.yaml")
+    ap.add_argument("--test_only", action="store_true", help="Run only evaluation on final_model.pt")
     return ap.parse_args()
 
 
-def main():
+# ----------------------------
+# Main
+# ----------------------------
+if __name__ == "__main__":
     args = parse_args()
 
-    seed = None if (args.seed is not None and args.seed < 0) else args.seed
+    if args.test_only:
+        print("[SERVER] Running in TEST-ONLY mode.")
+        if not Path(args.final_out).exists():
+            print(f"[SERVER][WARN] {args.final_out} not found. "
+                  f"Make sure you saved a model there, or pass --final_out to where your model is.")
+        test_final_model(
+            model_path=args.final_out,
+            test_videos_dir=args.test_videos_dir,
+            test_yaml_path=args.test_yaml,
+        )
+        print("[SERVER] Test-only run completed.")
+        raise SystemExit(0)
 
-    client = YOLOFlowerClient(
-        base_ckpt=Path(args.model),
-        work_root=Path(args.work_root),
-        labeled_dir=Path(args.labeled_dir),
-        split=args.split,
-        epochs=args.epochs,
-        imgsz=args.imgsz,
-        nc=args.nc,
-        names=args.names,
-        seed=seed,
+    # --- Normal federated training mode ---
+    strategy = FedAvgWithSave(
+        min_fit_clients=1,
+        min_evaluate_clients=1,
+        min_available_clients=1,
     )
 
-    print(f"[CLIENT] Connecting to server at {args.server}")
-    fl.client.start_numpy_client(server_address=args.server, client=client)
+    fl.server.start_server(
+        server_address="0.0.0.0:8080",
+        config=fl.server.ServerConfig(num_rounds=args.num_rounds),
+        strategy=strategy,
+    )
 
+    if strategy.final_parameters is None:
+        print("[SERVER] No final parameters were found to save.")
+        raise SystemExit(0)
 
-if __name__ == "__main__":
-    main()
+    # Save aggregated global model and then evaluate it
+    model_path = save_final_model(
+        params=strategy.final_parameters,
+        base_ckpt=args.base_ckpt,
+        out_path=args.final_out,
+    )
+
+    test_final_model(
+        model_path=str(model_path),
+        test_videos_dir=args.test_videos_dir,
+        test_yaml_path=args.test_yaml,
+    )
