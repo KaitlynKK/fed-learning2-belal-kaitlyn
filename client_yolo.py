@@ -5,6 +5,7 @@ from pathlib import Path
 import flwr as fl
 from flwr.common import parameters_to_ndarrays
 from ultralytics import YOLO
+import random
 
 # --- Strategy that remembers last aggregated params ---
 class FedAvgWithSave(fl.server.strategy.FedAvg):
@@ -55,33 +56,27 @@ def test_final_model(model_path="static/output/final_model.pt",
     summary_path = os.path.join(save_dir, "test_summary.txt")
     summary_lines = ["=== TEST PERFORMANCE SUMMARY ===\n"]
 
-        # --- Video inference (visuals)
+    # --- Video inference ---
     for fname in os.listdir(test_videos_dir):
-        if Path(fname).suffix.lower() in VIDEO_EXTS:
-            src = str(Path(test_videos_dir) / fname)
-            out_dir = str(Path(save_dir) / Path(fname).stem)
+        if fname.lower().endswith((".mp4", ".mov", ".avi", ".mkv")):
+            src = os.path.join(test_videos_dir, fname)
             print(f"[SERVER] Inference on: {fname}")
             try:
-                # stream=True prevents results from piling up in RAM
-                preds = model.predict(
+                model.predict(
                     source=src,
                     save=True,
-                    save_dir=out_dir,
-                    imgsz=640,
+                    save_dir=os.path.join(save_dir, os.path.splitext(fname)[0]),
                     conf=0.25,
-                    stream=True,   # ✅ added
-                    verbose=False,
-                    vid_stride=1   # optional: skip frames for faster processing
+                    imgsz=640,
+                    stream=True,
+                    verbose=False
                 )
-                # consume the generator so frames are processed and then released
-                for _ in preds:
-                    pass
+                summary_lines.append(f"{fname}: Success\n")
             except Exception as e:
-                print(f"[SERVER][WARN] Could not process {fname}: {e}")
-            finally:
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                print(f"[ERROR] Could not process {fname}: {e}")
+                summary_lines.append(f"{fname}: Failed ({e})\n")
 
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
     # --- Evaluate performance metrics on labelled dataset ---
     try:
